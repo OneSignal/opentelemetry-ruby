@@ -153,61 +153,63 @@ module OpenTelemetry
           timeout ||= @timeout
           start_time = OpenTelemetry::Common::Utilities.timeout_timestamp
           around_request do # rubocop:disable Metrics/BlockLength
-            request = Net::HTTP::Post.new(@path)
-            request.body = if @compression == 'gzip'
-                             request.add_field('Content-Encoding', 'gzip')
-                             Zlib.gzip(bytes)
-                           else
-                             bytes
-                           end
-            request.add_field('Content-Type', 'application/x-protobuf')
-            @headers&.each { |key, value| request.add_field(key, value) }
+            begin
+              request = Net::HTTP::Post.new(@path)
+              request.body = if @compression == 'gzip'
+                              request.add_field('Content-Encoding', 'gzip')
+                              Zlib.gzip(bytes)
+                            else
+                              bytes
+                            end
+              request.add_field('Content-Type', 'application/x-protobuf')
+              @headers&.each { |key, value| request.add_field(key, value) }
 
-            remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
-            return TIMEOUT if remaining_timeout.zero?
+              remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
+              return TIMEOUT if remaining_timeout.zero?
 
-            @http.open_timeout = remaining_timeout
-            @http.read_timeout = remaining_timeout
-            @http.write_timeout = remaining_timeout if WRITE_TIMEOUT_SUPPORTED
-            @http.start unless @http.started?
-            response = measure_request_duration { @http.request(request) }
+              @http.open_timeout = remaining_timeout
+              @http.read_timeout = remaining_timeout
+              @http.write_timeout = remaining_timeout if WRITE_TIMEOUT_SUPPORTED
+              @http.start unless @http.started?
+              response = measure_request_duration { @http.request(request) }
 
-            case response
-            when Net::HTTPOK
-              response.body # Read and discard body
-              SUCCESS
-            when Net::HTTPServiceUnavailable, Net::HTTPTooManyRequests
-              response.body # Read and discard body
-              redo if backoff?(retry_after: response['Retry-After'], retry_count: retry_count += 1, reason: response.code)
-              FAILURE
-            when Net::HTTPRequestTimeOut, Net::HTTPGatewayTimeOut, Net::HTTPBadGateway
-              response.body # Read and discard body
-              redo if backoff?(retry_count: retry_count += 1, reason: response.code)
-              FAILURE
-            when Net::HTTPBadRequest, Net::HTTPClientError, Net::HTTPServerError
-              # TODO: decode the body as a google.rpc.Status Protobuf-encoded message when https://github.com/open-telemetry/opentelemetry-collector/issues/1357 is fixed.
-              response.body # Read and discard body
-              FAILURE
-            when Net::HTTPRedirection
-              @http.finish
-              handle_redirect(response['location'])
-              redo if backoff?(retry_after: 0, retry_count: retry_count += 1, reason: response.code)
-            else
-              @http.finish
-              FAILURE
+              case response
+              when Net::HTTPOK
+                response.body # Read and discard body
+                SUCCESS
+              when Net::HTTPServiceUnavailable, Net::HTTPTooManyRequests
+                response.body # Read and discard body
+                redo if backoff?(retry_after: response['Retry-After'], retry_count: retry_count += 1, reason: response.code)
+                FAILURE
+              when Net::HTTPRequestTimeOut, Net::HTTPGatewayTimeOut, Net::HTTPBadGateway
+                response.body # Read and discard body
+                redo if backoff?(retry_count: retry_count += 1, reason: response.code)
+                FAILURE
+              when Net::HTTPBadRequest, Net::HTTPClientError, Net::HTTPServerError
+                # TODO: decode the body as a google.rpc.Status Protobuf-encoded message when https://github.com/open-telemetry/opentelemetry-collector/issues/1357 is fixed.
+                response.body # Read and discard body
+                FAILURE
+              when Net::HTTPRedirection
+                @http.finish
+                handle_redirect(response['location'])
+                redo if backoff?(retry_after: 0, retry_count: retry_count += 1, reason: response.code)
+              else
+                @http.finish
+                FAILURE
+              end
+            rescue Net::OpenTimeout, Net::ReadTimeout
+              retry if backoff?(retry_count: retry_count += 1, reason: 'timeout')
+              return FAILURE
+            rescue SocketError
+              retry if backoff?(retry_count: retry_count += 1, reason: 'socket_error')
+              return FAILURE
+            rescue SystemCallError => e
+              retry if backoff?(retry_count: retry_count += 1, reason: e.class.name)
+              return FAILURE
+            rescue EOFError
+              retry if backoff?(retry_count: retry_count += 1, reason: 'eof_error')
+              return FAILURE
             end
-          rescue Net::OpenTimeout, Net::ReadTimeout
-            retry if backoff?(retry_count: retry_count += 1, reason: 'timeout')
-            return FAILURE
-          rescue SocketError
-            retry if backoff?(retry_count: retry_count += 1, reason: 'socket_error')
-            return FAILURE
-          rescue SystemCallError => e
-            retry if backoff?(retry_count: retry_count += 1, reason: e.class.name)
-            return FAILURE
-          rescue EOFError
-            retry if backoff?(retry_count: retry_count += 1, reason: 'eof_error')
-            return FAILURE
           end
         ensure
           # Reset timeouts to defaults for the next call.
@@ -288,6 +290,11 @@ module OpenTelemetry
         end
 
         def as_otlp_span(span_data) # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
+          status = span_data.status && Opentelemetry::Proto::Trace::V1::Status.new(
+            code: span_data.status.code == OpenTelemetry::Trace::Status::ERROR ? Opentelemetry::Proto::Trace::V1::Status::StatusCode::UnknownError : Opentelemetry::Proto::Trace::V1::Status::StatusCode::Ok,
+            message: span_data.status.description
+          )
+
           Opentelemetry::Proto::Trace::V1::Span.new(
             trace_id: span_data.trace_id,
             span_id: span_data.span_id,
@@ -318,13 +325,7 @@ module OpenTelemetry
               )
             end,
             dropped_links_count: span_data.total_recorded_links - span_data.links&.size.to_i,
-            status: span_data.status&.yield_self do |status|
-              # TODO: fix this based on spec update.
-              Opentelemetry::Proto::Trace::V1::Status.new(
-                code: status.code == OpenTelemetry::Trace::Status::ERROR ? Opentelemetry::Proto::Trace::V1::Status::StatusCode::UnknownError : Opentelemetry::Proto::Trace::V1::Status::StatusCode::Ok,
-                message: status.description
-              )
-            end
+            status: status,
           )
         end
 

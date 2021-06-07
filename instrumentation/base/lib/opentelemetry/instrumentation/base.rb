@@ -261,25 +261,27 @@ module OpenTelemetry
         @options ||= {}
         user_config ||= {}
         validated_config = @options.each_with_object({}) do |option, h|
-          option_name = option[:name]
-          config_value = user_config[option_name]
+          begin
+            option_name = option[:name]
+            config_value = user_config[option_name]
 
-          value = if config_value.nil?
-                    option[:default]
-                  elsif option[:validate].call(config_value)
-                    config_value
-                  else
-                    OpenTelemetry.logger.warn(
-                      "Instrumentation #{name} configuration option #{option_name} value=#{config_value} " \
-                      "failed validation, falling back to default value=#{option[:default]}"
-                    )
-                    option[:default]
-                  end
+            value = if config_value.nil?
+                      option[:default]
+                    elsif option[:validate].call(config_value)
+                      config_value
+                    else
+                      OpenTelemetry.logger.warn(
+                        "Instrumentation #{name} configuration option #{option_name} value=#{config_value} " \
+                        "failed validation, falling back to default value=#{option[:default]}"
+                      )
+                      option[:default]
+                    end
 
-          h[option_name] = value
-        rescue StandardError => e
-          OpenTelemetry.handle_error(exception: e, message: "Instrumentation #{name} unexpected configuration error")
-          h[option_name] = option[:default]
+            h[option_name] = value
+          rescue StandardError => e
+            OpenTelemetry.handle_error(exception: e, message: "Instrumentation #{name} unexpected configuration error")
+            h[option_name] = option[:default]
+          end
         end
 
         dropped_config_keys = user_config.keys - validated_config.keys
